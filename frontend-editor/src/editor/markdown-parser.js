@@ -1,3 +1,5 @@
+import { markdownLanguage } from '@codemirror/lang-markdown'
+
 /**
  * Markdown parser utilities.
  * Parses raw markdown text and identifies syntax regions for decoration.
@@ -162,12 +164,10 @@ export function parseMarkdownRegions(doc) {
       })
     }
 
-    // Inline patterns on this line
-    parseInlineRegions(line, lineStart, regions)
-
     pos = lineEnd + 1
   }
 
+  parseInlineRegions(doc, regions)
   return regions
 }
 
@@ -180,93 +180,165 @@ function findCodeBlockStartLine(lines, codeBlockStart, currentPos) {
   return 0
 }
 
-/**
- * Parse inline markdown patterns within a single line.
- */
-function parseInlineRegions(line, lineStart, regions) {
-  // Image: ![alt](url)
-  const imgRe = /!\[([^\]]*)\]\(([^)]+)\)/g
-  let m
-  while ((m = imgRe.exec(line)) !== null) {
+function getDirectChildren(node, name) {
+  const result = []
+  for (let child = node.firstChild; child; child = child.nextSibling) {
+    if (child.name === name) result.push(child)
+  }
+  return result
+}
+
+function getChild(node, name) {
+  for (let child = node.firstChild; child; child = child.nextSibling) {
+    if (child.name === name) return child
+  }
+  return null
+}
+
+function addEmphasisRegion(node, doc, regions) {
+  const marks = getDirectChildren(node, 'EmphasisMark')
+  const opening = marks[0]
+  const closing = marks[marks.length - 1]
+  if (!opening || !closing) return
+
+  const marker = doc.slice(opening.from, opening.to)[0]
+  const isBold = opening.to - opening.from === 2
+  regions.push({
+    type: isBold ? 'bold' : 'italic',
+    from: node.from,
+    to: node.to,
+    contentFrom: opening.to,
+    contentTo: closing.from,
+    meta: { marker: marker.repeat(isBold ? 2 : 1) }
+  })
+}
+
+function addStrikethroughRegion(node, doc, regions) {
+  const marks = getDirectChildren(node, 'StrikethroughMark')
+  const opening = marks[0]
+  const closing = marks[marks.length - 1]
+  if (!opening || !closing || opening.to - opening.from !== 2) return
+
+  regions.push({
+    type: 'strikethrough',
+    from: node.from,
+    to: node.to,
+    contentFrom: opening.to,
+    contentTo: closing.from,
+    meta: { marker: doc.slice(opening.from, opening.to) }
+  })
+}
+
+function addInlineCodeRegion(node, doc, regions) {
+  const marks = getDirectChildren(node, 'CodeMark')
+  const opening = marks[0]
+  const closing = marks[marks.length - 1]
+  if (!opening || !closing) return
+
+  const markerLen = opening.to - opening.from
+  if (closing.to - closing.from !== markerLen) return
+
+  regions.push({
+    type: 'inline-code',
+    from: node.from,
+    to: node.to,
+    contentFrom: opening.to,
+    contentTo: closing.from,
+    meta: { markerLen }
+  })
+}
+
+function addLinkLikeRegion(node, doc, regions) {
+  const marks = getDirectChildren(node, 'LinkMark')
+  if (marks.length < 4) return
+
+  const isImage = node.name === 'Image'
+  const openingText = marks[0]
+  const closingText = marks[1]
+  const openingDestination = marks[2]
+  const closingDestination = marks[3]
+
+  const expectedOpening = isImage ? '![' : '['
+  if (doc.slice(openingText.from, openingText.to) !== expectedOpening) return
+  if (doc.slice(closingText.from, closingText.to) !== ']') return
+  if (doc.slice(openingDestination.from, openingDestination.to) !== '(') return
+  if (doc.slice(closingDestination.from, closingDestination.to) !== ')') return
+
+  const contentFrom = openingText.to
+  const contentTo = closingText.from
+  const urlNode = getChild(node, 'URL')
+  let url = urlNode ? doc.slice(urlNode.from, urlNode.to) : ''
+
+  // Angle-bracket destinations include their wrapping characters in the URL node.
+  if (url.startsWith('<') && url.endsWith('>') && url.length >= 2) {
+    url = url.slice(1, -1)
+  }
+
+  if (isImage) {
+    // Keep the previous requirement for a concrete image destination.
+    if (!url.trim()) return
     regions.push({
       type: 'image',
-      from: lineStart + m.index,
-      to: lineStart + m.index + m[0].length,
-      contentFrom: lineStart + m.index + 2,
-      contentTo: lineStart + m.index + 2 + m[1].length,
-      meta: { alt: m[1], url: m[2] }
+      from: node.from,
+      to: node.to,
+      contentFrom,
+      contentTo,
+      meta: { alt: doc.slice(contentFrom, contentTo), url }
     })
+    return
   }
 
-  // Link: [text](url) — but not images
-  const linkRe = /(?<!!)\[([^\]]+)\]\(([^)]+)\)/g
-  while ((m = linkRe.exec(line)) !== null) {
-    regions.push({
-      type: 'link',
-      from: lineStart + m.index,
-      to: lineStart + m.index + m[0].length,
-      contentFrom: lineStart + m.index + 1,
-      contentTo: lineStart + m.index + 1 + m[1].length,
-      meta: { text: m[1], url: m[2] }
-    })
-  }
+  regions.push({
+    type: 'link',
+    from: node.from,
+    to: node.to,
+    contentFrom,
+    contentTo,
+    meta: { text: doc.slice(contentFrom, contentTo), url }
+  })
+}
 
-  // Bold: **text** or __text__
-  const boldRe = /(\*\*|__)(?!\s)(.+?)(?<!\s)\1/g
-  while ((m = boldRe.exec(line)) !== null) {
-    regions.push({
-      type: 'bold',
-      from: lineStart + m.index,
-      to: lineStart + m.index + m[0].length,
-      contentFrom: lineStart + m.index + 2,
-      contentTo: lineStart + m.index + 2 + m[2].length,
-      meta: { marker: m[1] }
-    })
-  }
+/**
+ * Parse inline regions from the CommonMark/GFM syntax tree. Unlike independent
+ * regular expressions, the tree gives exact marker boundaries for nested
+ * emphasis, links, Chinese punctuation, and leaves code content untouched.
+ */
+function parseInlineRegions(doc, regions) {
+  const tree = markdownLanguage.parser.parse(doc)
+  const inlineTypes = new Set([
+    'StrongEmphasis',
+    'Emphasis',
+    'Strikethrough',
+    'InlineCode',
+    'Link',
+    'Image'
+  ])
 
-  // Italic: *text* or _text_ (not bold)
-  const italicRe = /(?<!\*|\w)(\*|_)(?!\s|\1)(.+?)(?<!\s)\1(?!\*|\w)/g
-  while ((m = italicRe.exec(line)) !== null) {
-    // Skip if this is part of a bold marker
-    const fullFrom = lineStart + m.index
-    const isBold = regions.some(r => r.type === 'bold' && r.from <= fullFrom && r.to >= fullFrom + m[0].length)
-    if (isBold) continue
-    regions.push({
-      type: 'italic',
-      from: fullFrom,
-      to: fullFrom + m[0].length,
-      contentFrom: fullFrom + 1,
-      contentTo: fullFrom + 1 + m[2].length,
-      meta: { marker: m[1] }
-    })
-  }
+  tree.iterate({
+    enter(nodeRef) {
+      if (!inlineTypes.has(nodeRef.name)) return
 
-  // Strikethrough: ~~text~~
-  const strikeRe = /~~(?!\s)(.+?)(?<!\s)~~/g
-  while ((m = strikeRe.exec(line)) !== null) {
-    regions.push({
-      type: 'strikethrough',
-      from: lineStart + m.index,
-      to: lineStart + m.index + m[0].length,
-      contentFrom: lineStart + m.index + 2,
-      contentTo: lineStart + m.index + 2 + m[1].length,
-      meta: {}
-    })
-  }
+      const node = nodeRef.node
+      switch (node.name) {
+        case 'StrongEmphasis':
+        case 'Emphasis':
+          addEmphasisRegion(node, doc, regions)
+          break
+        case 'Strikethrough':
+          addStrikethroughRegion(node, doc, regions)
+          break
+        case 'InlineCode':
+          addInlineCodeRegion(node, doc, regions)
+          break
+        case 'Link':
+        case 'Image':
+          addLinkLikeRegion(node, doc, regions)
+          break
+      }
+    }
+  })
 
-  // Inline code: `code`
-  const codeRe = /(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)/g
-  while ((m = codeRe.exec(line)) !== null) {
-    const markerLen = m[1].length
-    regions.push({
-      type: 'inline-code',
-      from: lineStart + m.index,
-      to: lineStart + m.index + m[0].length,
-      contentFrom: lineStart + m.index + markerLen,
-      contentTo: lineStart + m.index + markerLen + m[2].length,
-      meta: { markerLen }
-    })
-  }
+  regions.sort((a, b) => a.from - b.from || b.to - a.to)
 }
 
 /**

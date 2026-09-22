@@ -148,24 +148,39 @@ const listMarkerDeco = Decoration.mark({ class: 'md-list-marker' })
 const headingMarkDeco = Decoration.mark({ class: 'md-heading-mark' })
 
 /**
- * Get the line range that the cursor is on.
- * Returns { from, to } of the current line(s) covered by all selections.
+ * Get the exact ranges covered by all selections.
  */
-function getCursorLineRanges(state) {
-  const ranges = []
-  for (const sel of state.selection.ranges) {
-    const lineFrom = state.doc.lineAt(sel.from)
-    const lineTo = state.doc.lineAt(sel.to)
-    ranges.push({ from: lineFrom.from, to: lineTo.to })
-  }
-  return ranges
+function getCursorRanges(state) {
+  return state.selection.ranges.map(sel => ({ from: sel.from, to: sel.to }))
 }
 
 /**
- * Check if a region overlaps with any cursor line range.
+ * Get the line range(s) covered by all selections for block-level syntax.
+ */
+function getCursorLineRanges(state) {
+  return state.selection.ranges.map(sel => {
+    const lineFrom = state.doc.lineAt(sel.from)
+    const lineTo = state.doc.lineAt(sel.to)
+    return { from: lineFrom.from, to: lineTo.to }
+  })
+}
+
+const blockRegionTypes = new Set([
+  'heading',
+  'image',
+  'hr',
+  'blockquote',
+  'list-bullet',
+  'list-ordered',
+  'task-list',
+  'code-block'
+])
+
+/**
+ * Check if a selection touches a syntax region.
  */
 function isCursorOnRegion(region, cursorRanges) {
-  return cursorRanges.some(cr => region.from <= cr.to && region.to >= cr.from)
+  return cursorRanges.some(cr => Math.max(region.from, cr.from) <= Math.min(region.to, cr.to))
 }
 
 /**
@@ -176,14 +191,16 @@ function buildDecorations(view) {
   const { state } = view
   const doc = state.doc.toString()
   const regions = parseMarkdownRegions(doc)
-  const cursorRanges = getCursorLineRanges(state)
+  const cursorRanges = getCursorRanges(state)
+  const cursorLineRanges = getCursorLineRanges(state)
   const builder = new RangeSetBuilder()
 
   // We need to collect all decorations and sort them by from position
   const decos = []
 
   for (const region of regions) {
-    const cursorOn = isCursorOnRegion(region, cursorRanges)
+    const activeRanges = blockRegionTypes.has(region.type) ? cursorLineRanges : cursorRanges
+    const cursorOn = isCursorOnRegion(region, activeRanges)
 
     switch (region.type) {
       case 'heading': {
