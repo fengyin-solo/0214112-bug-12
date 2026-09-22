@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node scripts/test-inline-parity.mjs && node scripts/test-inline-fuzz.mjs && node scripts/test-decorations.mjs && node --experimental-loader ./scripts/esm-loader.mjs scripts/test-transactions.mjs"
   },
   "dependencies": {
     "vue": "^3.4.21",

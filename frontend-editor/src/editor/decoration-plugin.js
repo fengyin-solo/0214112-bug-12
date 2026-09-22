@@ -175,7 +175,15 @@ function isCursorOnRegion(region, cursorRanges) {
 function buildDecorations(view) {
   const { state } = view
   const doc = state.doc.toString()
-  const regions = parseMarkdownRegions(doc)
+  let regions
+  try {
+    regions = parseMarkdownRegions(doc)
+  } catch (err) {
+    // Never let an unexpected parse/build failure strip all styling or
+    // block editing — degrade gracefully to plain (decorated) text.
+    console.error('[markdown decoration] parse failed:', err)
+    return Decoration.none
+  }
   const cursorRanges = getCursorLineRanges(state)
   const builder = new RangeSetBuilder()
 
@@ -203,51 +211,39 @@ function buildDecorations(view) {
       case 'bold': {
         // Apply bold to content
         decos.push({ from: region.contentFrom, to: region.contentTo, deco: boldDeco })
-        if (!cursorOn) {
-          // Hide markers
-          decos.push({ from: region.from, to: region.contentFrom, deco: syntaxHiddenDeco })
-          decos.push({ from: region.contentTo, to: region.to, deco: syntaxHiddenDeco })
-        } else {
-          decos.push({ from: region.from, to: region.contentFrom, deco: syntaxVisibleDeco })
-          decos.push({ from: region.contentTo, to: region.to, deco: syntaxVisibleDeco })
+        const markerDeco = cursorOn ? syntaxVisibleDeco : syntaxHiddenDeco
+        for (const [mFrom, mTo] of region.meta.markerRanges) {
+          decos.push({ from: mFrom, to: mTo, deco: markerDeco })
         }
         break
       }
 
       case 'italic': {
         decos.push({ from: region.contentFrom, to: region.contentTo, deco: italicDeco })
-        if (!cursorOn) {
-          decos.push({ from: region.from, to: region.contentFrom, deco: syntaxHiddenDeco })
-          decos.push({ from: region.contentTo, to: region.to, deco: syntaxHiddenDeco })
-        } else {
-          decos.push({ from: region.from, to: region.contentFrom, deco: syntaxVisibleDeco })
-          decos.push({ from: region.contentTo, to: region.to, deco: syntaxVisibleDeco })
+        const markerDeco = cursorOn ? syntaxVisibleDeco : syntaxHiddenDeco
+        for (const [mFrom, mTo] of region.meta.markerRanges) {
+          decos.push({ from: mFrom, to: mTo, deco: markerDeco })
         }
         break
       }
 
       case 'strikethrough': {
         decos.push({ from: region.contentFrom, to: region.contentTo, deco: strikeDeco })
-        if (!cursorOn) {
-          decos.push({ from: region.from, to: region.contentFrom, deco: syntaxHiddenDeco })
-          decos.push({ from: region.contentTo, to: region.to, deco: syntaxHiddenDeco })
-        } else {
-          decos.push({ from: region.from, to: region.contentFrom, deco: syntaxVisibleDeco })
-          decos.push({ from: region.contentTo, to: region.to, deco: syntaxVisibleDeco })
+        const markerDeco = cursorOn ? syntaxVisibleDeco : syntaxHiddenDeco
+        for (const [mFrom, mTo] of region.meta.markerRanges) {
+          decos.push({ from: mFrom, to: mTo, deco: markerDeco })
         }
         break
       }
 
       case 'inline-code': {
         decos.push({ from: region.contentFrom, to: region.contentTo, deco: inlineCodeDeco })
-        if (!cursorOn) {
-          const markerLen = region.meta.markerLen
-          decos.push({ from: region.from, to: region.from + markerLen, deco: syntaxHiddenDeco })
-          decos.push({ from: region.to - markerLen, to: region.to, deco: syntaxHiddenDeco })
-        } else {
-          const markerLen = region.meta.markerLen
-          decos.push({ from: region.from, to: region.from + markerLen, deco: syntaxVisibleDeco })
-          decos.push({ from: region.to - markerLen, to: region.to, deco: syntaxVisibleDeco })
+        // markerRanges covers the backticks plus any space-padding trimmed
+        // in rendered output, keeping raw and rendered views exactly in
+        // sync for each inline code span.
+        const markerDeco = cursorOn ? syntaxVisibleDeco : syntaxHiddenDeco
+        for (const [mFrom, mTo] of region.meta.markerRanges) {
+          decos.push({ from: mFrom, to: mTo, deco: markerDeco })
         }
         break
       }
@@ -355,25 +351,44 @@ function buildDecorations(view) {
     }
   }
 
-  // Sort decorations by from position, then by whether they are line decorations
+  // Total ordering for RangeSetBuilder: by `from` ascending, line
+  // decorations first, then `to` descending (so enclosing/overlapping
+  // ranges feed the builder layers in a deterministic order and it never
+  // throws "Ranges must be added sorted".
   decos.sort((a, b) => {
     if (a.from !== b.from) return a.from - b.from
-    // Line decorations should come before mark decorations at the same position
-    if (a.isLine && !b.isLine) return -1
-    if (!a.isLine && b.isLine) return 1
-    return 0
+    if (a.isLine !== b.isLine) return a.isLine ? -1 : 1
+    return b.to - a.to
   })
 
-  // Filter out invalid ranges (from >= to for non-line decorations)
+  // Skip invalid ranges (from >= to for non-line decorations)
   for (const d of decos) {
-    if (d.isLine) {
-      builder.add(d.from, d.from, d.deco)
-    } else if (d.from < d.to) {
-      builder.add(d.from, d.to, d.deco)
+    try {
+      if (d.isLine) {
+        builder.add(d.from, d.from, d.deco)
+      } else if (d.from < d.to) {
+        builder.add(d.from, d.to, d.deco)
+      }
+    } catch (err) {
+      // An out-of-order range must not blank the whole document
+      console.error('[markdown decoration] ignored bad range:', err)
     }
   }
 
-  return builder.finish()
+  try {
+    return builder.finish()
+  } catch (err) {
+    console.error('[markdown decoration] build failed:', err)
+    return Decoration.none
+  }
+}
+
+/**
+ * Build the decoration set for an editor view. Exported for testing.
+ * @param {{state: import('@codemirror/state').EditorState}} view
+ */
+export function buildDecorationsForView(view) {
+  return buildDecorations(view)
 }
 
 /**
